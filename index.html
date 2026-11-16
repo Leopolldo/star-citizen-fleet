@@ -1,3 +1,4 @@
+HTML
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -424,17 +425,18 @@
       <div class="brand-badge"></div>
       <div>
         <h1>Star Citizen Fleet</h1>
-        <span>Live Fleet Database // GitHub Pages Edition</span>
+        <span>Star Citizen Wiki // Live Database</span>
       </div>
     </div>
     <div class="stats-bar">
-      <div>Total na Frota: <strong id="count-total">0</strong></div>
+      <div>Frota: <strong id="count-total">0</strong></div>
       <div>Exibindo: <strong id="count-filtered">0</strong></div>
+      <div>Imagens: <strong id="count-images">0</strong></div>
     </div>
   </header>
 
   <div id="progress-container">
-    <span id="progress-text">Sincronizando banco de dados e imagens...</span>
+    <span id="progress-text">Conectando à API da Star Citizen Wiki...</span>
     <div class="progress-track">
       <div class="progress-fill" id="progress-fill"></div>
     </div>
@@ -471,12 +473,12 @@
 
   <script>
     const SC_WIKI_API = 'https://api.star-citizen.wiki/api/v2/vehicles';
-    const FLEETYARDS_API = 'https://api.fleetyards.net/v1/models';
+    const WIKI_MEDIAWIKI_API = 'https://starcitizen.tools/api.php';
 
     let allVehicles = [];
     const detailsCache = new Map();
-    const fyModelsBySlug = new Map();
-    const fyModelsByName = new Map();
+    const wikiImages = new Map();
+    const queriedNames = new Set();
 
     const gridEl = document.getElementById('ships-grid');
     const searchInput = document.getElementById('search-input');
@@ -486,17 +488,11 @@
     const resetBtn = document.getElementById('btn-reset');
     const countTotalEl = document.getElementById('count-total');
     const countFilteredEl = document.getElementById('count-filtered');
+    const countImagesEl = document.getElementById('count-images');
     const progressText = document.getElementById('progress-text');
     const progressFill = document.getElementById('progress-fill');
     const progressContainer = document.getElementById('progress-container');
     const backdrop = document.getElementById('modal-backdrop');
-
-    function normalizeKey(str) {
-      return String(str || '')
-        .toLowerCase()
-        .replace(/^(aegis|anvil|argo|banu|consolidated outland|crusader|drake|esperia|gatac|greycat|kruger|misc|mirai|origin|rsi|roberts space industries|tumbril|vanduul|aopoa)\s+/i, '')
-        .replace(/[^a-z0-9]/g, '');
-    }
 
     function getLocalizedText(field, fallback = 'N/A') {
       if (field === null || field === undefined) return fallback;
@@ -528,97 +524,68 @@
       return 'status-prod';
     }
 
-    // Extrai URL de imagem de qualquer formato de retorno da FleetYards API
-    function extractFleetYardsImage(m) {
-      if (!m) return '';
-      const candidates = [
-        m.storeImageLarge,
-        m.storeImageMedium,
-        m.storeImageSmall,
-        m.storeImage,
-        m.media?.storeImage?.large,
-        m.media?.storeImage?.medium,
-        m.media?.storeImage?.source,
-        m.angledViewLarge,
-        m.angledViewMedium,
-        m.media?.angledView?.large,
-        m.media?.angledView?.medium,
-        m.fleetchartImage,
-        m.media?.fleetchartImage
-      ];
-      return candidates.find(u => typeof u === 'string' && u.startsWith('http')) || '';
-    }
+    // Busca imagens diretamente na API oficial da Star Citizen Wiki (origin=* funciona no GitHub Pages HTTPS)
+    async function fetchWikiImagesBatch(names) {
+      const pending = [...new Set(names)].filter(n => n && !wikiImages.has(n) && !queriedNames.has(n));
+      if (pending.length === 0) return;
 
-    // Carrega o catálogo do FleetYards (imagens e specs extras)
-    async function loadFleetYardsCatalog() {
-      const collected = [];
-      try {
-        let page = 1;
-        while (page <= 15) {
-          const res = await fetch(`${FLEETYARDS_API}?per_page=100&page=${page}`, {
-            headers: { 'Accept': 'application/json' }
+      // MediaWiki aceita até 50 títulos por requisição
+      for (let i = 0; i < pending.length; i += 40) {
+        const batch = pending.slice(i, i + 40);
+        batch.forEach(n => queriedNames.add(n));
+
+        const params = new URLSearchParams({
+          action: 'query',
+          titles: batch.join('|'),
+          prop: 'pageimages|images',
+          piprop: 'thumbnail|original',
+          pithumbsize: '640',
+          redirects: '1',
+          format: 'json',
+          origin: '*'
+        });
+
+        try {
+          const res = await fetch(`${WIKI_MEDIAWIKI_API}?${params.toString()}`);
+          if (!res.ok) continue;
+
+          const data = await res.json();
+          const pages = data?.query?.pages || {};
+          const normalized = {};
+          const redirects = {};
+
+          (data?.query?.normalized || []).forEach(item => { normalized[item.to] = item.from; });
+          (data?.query?.redirects || []).forEach(item => { redirects[item.to] = item.from; });
+
+          Object.values(pages).forEach(page => {
+            const imgUrl = page.thumbnail?.source || page.original?.source || '';
+            if (!imgUrl) return;
+
+            let orig = page.title;
+            if (redirects[orig]) orig = redirects[orig];
+            if (normalized[orig]) orig = normalized[orig];
+
+            wikiImages.set(page.title.toLowerCase(), imgUrl);
+            wikiImages.set(orig.toLowerCase(), imgUrl);
           });
-          if (!res.ok) break;
 
-          const models = await res.json();
-          if (!Array.isArray(models) || models.length === 0) break;
-
-          models.forEach(m => {
-            collected.push(m);
-            const img = extractFleetYardsImage(m);
-            if (img) {
-              if (m.slug) fyModelsBySlug.set(m.slug.toLowerCase(), m);
-              if (m.rsiSlug) fyModelsBySlug.set(m.rsiSlug.toLowerCase(), m);
-              if (m.name) fyModelsByName.set(normalizeKey(m.name), m);
-              if (m.rsiName) fyModelsByName.set(normalizeKey(m.rsiName), m);
-            }
-          });
-
-          if (allVehicles.length > 0) {
-            updateVisibleCardImages();
-          }
-
-          if (models.length < 100) break;
-          page++;
-        }
-      } catch (err) {
-        console.warn('Aviso ao consultar FleetYards:', err);
-      }
-      return collected;
-    }
-
-    function findMatchingFYModel(v) {
-      if (!v) return null;
-      if (v.slug && fyModelsBySlug.has(v.slug.toLowerCase())) {
-        return fyModelsBySlug.get(v.slug.toLowerCase());
-      }
-      const norm = normalizeKey(v.name);
-      if (norm && fyModelsByName.has(norm)) {
-        return fyModelsByName.get(norm);
-      }
-      if (norm.length >= 4) {
-        for (const [key, model] of fyModelsByName.entries()) {
-          if (key === norm || key.startsWith(norm) || norm.startsWith(key)) {
-            return model;
-          }
+          countImagesEl.textContent = wikiImages.size;
+          applyLoadedImagesToDOM();
+        } catch (err) {
+          console.warn('Falha ao buscar lote de imagens na Wiki:', err);
         }
       }
-      return null;
     }
 
     function getVehicleImage(v) {
-      if (v._directImage) return v._directImage;
-      const fy = findMatchingFYModel(v);
-      return fy ? extractFleetYardsImage(fy) : '';
+      if (!v || !v.name) return '';
+      return wikiImages.get(v.name.toLowerCase()) || '';
     }
 
-    function updateVisibleCardImages() {
-      document.querySelectorAll('.card[data-vehicle-idx]').forEach(card => {
-        const idx = Number(card.getAttribute('data-vehicle-idx'));
-        const v = allVehicles[idx];
-        if (!v) return;
-
-        const imgUrl = getVehicleImage(v);
+    function applyLoadedImagesToDOM() {
+      document.querySelectorAll('.card[data-ship-name]').forEach(card => {
+        const name = card.getAttribute('data-ship-name');
+        const imgUrl = wikiImages.get(name.toLowerCase());
         if (!imgUrl) return;
 
         const imgEl = card.querySelector('img');
@@ -629,47 +596,35 @@
           if (placeholderEl) placeholderEl.style.display = 'none';
         }
       });
-    }
 
-    // Converte modelo FleetYards para o formato padrão caso a Wiki API falhe
-    function mapFYToStandard(m, idx) {
-      return {
-        _idx: idx,
-        _directImage: extractFleetYardsImage(m),
-        name: m.name,
-        slug: m.slug,
-        manufacturer: { name: m.manufacturer?.name || 'Desconhecido' },
-        focus: m.focus || m.classificationLabel || 'Multifunção',
-        production_status: m.productionStatusLabel || m.productionStatus || 'Desconhecido',
-        cargo_capacity: m.cargo,
-        crew: { min: m.minCrew, max: m.maxCrew },
-        sizes: { length: m.length, beam: m.beam, height: m.height },
-        mass: m.mass,
-        speed: { scm: m.scmSpeed, max: m.afterburnerSpeed },
-        msrp: m.lastPledgePrice || m.pledgePrice,
-        description: m.description,
-        type: m.classificationLabel,
-        size: m.sizeLabel
-      };
+      // Atualiza também o modal caso esteja aberto
+      const modalHero = document.getElementById('modal-hero-img');
+      if (modalHero) {
+        const modalShipName = modalHero.getAttribute('data-ship-name');
+        const imgUrl = wikiImages.get((modalShipName || '').toLowerCase());
+        if (imgUrl && modalHero.getAttribute('src') !== imgUrl) {
+          modalHero.src = imgUrl;
+          modalHero.style.display = 'block';
+        }
+      }
     }
 
     async function initDatabase() {
-      const fyPromise = loadFleetYardsCatalog();
-
       try {
         const firstRes = await fetch(`${SC_WIKI_API}?limit=100&page=1`);
         if (!firstRes.ok) throw new Error(`HTTP ${firstRes.status}`);
         const firstJson = await firstRes.json();
 
         allVehicles = [...(firstJson.data || [])];
-        allVehicles.forEach((v, i) => { v._idx = i; });
-
         const lastPage = firstJson.meta?.last_page || 1;
         const totalExpected = firstJson.meta?.total || allVehicles.length;
 
         updateProgress(1, lastPage, totalExpected);
         populateFilters();
         renderVehicles();
+
+        // Inicia busca das imagens da página 1 imediatamente
+        fetchWikiImagesBatch(allVehicles.map(v => v.name));
 
         if (lastPage > 1) {
           const pageNumbers = [];
@@ -688,11 +643,12 @@
               )
             );
 
+            const newlyAddedNames = [];
             results.forEach(res => {
               if (res.data && Array.isArray(res.data)) {
                 res.data.forEach(item => {
-                  item._idx = allVehicles.length;
                   allVehicles.push(item);
+                  if (item.name) newlyAddedNames.push(item.name);
                 });
               }
             });
@@ -701,31 +657,20 @@
             updateProgress(completedPages, lastPage, totalExpected);
             populateFilters();
             renderVehicles();
+
+            // Busca imagens dos novos veículos carregados
+            fetchWikiImagesBatch(newlyAddedNames);
           }
         }
-
-        await fyPromise;
-        updateVisibleCardImages();
 
         progressText.textContent = `Sincronização concluída: ${allVehicles.length} veículos/naves carregados.`;
         progressFill.style.width = '100%';
         setTimeout(() => { progressContainer.style.display = 'none'; }, 2000);
 
       } catch (err) {
-        console.warn('Wiki API indisponível, usando catálogo completo do FleetYards:', err);
-        const fyModels = await fyPromise;
-        if (fyModels.length > 0) {
-          allVehicles = fyModels.map((m, idx) => mapFYToStandard(m, idx));
-          countTotalEl.textContent = allVehicles.length;
-          populateFilters();
-          renderVehicles();
-          progressText.textContent = `Carregado via FleetYards CDN: ${allVehicles.length} naves.`;
-          progressFill.style.width = '100%';
-          setTimeout(() => { progressContainer.style.display = 'none'; }, 2000);
-        } else {
-          progressText.textContent = 'Erro ao conectar às APIs. Verifique sua conexão com a internet.';
-          progressFill.style.background = '#ef4444';
-        }
+        console.error('Erro ao buscar lista:', err);
+        progressText.textContent = `Erro ao carregar API (${err.message}).`;
+        progressFill.style.background = '#ef4444';
       }
     }
 
@@ -805,13 +750,18 @@
       }
 
       const fragment = document.createDocumentFragment();
+      const missingVisibleNames = [];
 
       filtered.forEach(v => {
         const card = document.createElement('article');
         card.className = 'card';
-        card.setAttribute('data-vehicle-idx', v._idx);
+        card.setAttribute('data-ship-name', v.name || '');
 
         const imgUrl = getVehicleImage(v);
+        if (!imgUrl && v.name) {
+          missingVisibleNames.push(v.name);
+        }
+
         const status = getLocalizedText(v.production_status, 'Desconhecido');
         const statusClass = getStatusClass(status);
         const mfg = v.manufacturer?.name || 'Fabricante Desconhecido';
@@ -864,44 +814,39 @@
 
       gridEl.innerHTML = '';
       gridEl.appendChild(fragment);
+
+      if (missingVisibleNames.length > 0) {
+        fetchWikiImagesBatch(missingVisibleNames);
+      }
     }
 
     function renderModalContent(v, isLoadingDetails = false) {
-      const fy = findMatchingFYModel(v);
       const imgUrl = getVehicleImage(v);
+      const desc = getLocalizedText(v.description, 'Nenhuma descrição disponível na Wiki para este veículo.');
+      const status = getLocalizedText(v.production_status, 'N/A');
+      const size = getLocalizedText(v.size, 'N/A');
+      const type = getLocalizedText(v.type, 'N/A');
+      const focus = getLocalizedText(v.focus, 'N/A');
+      const cargo = v.cargo_capacity != null ? `${v.cargo_capacity} SCU` : 'N/A';
 
-      const desc = getLocalizedText(v.description, fy?.description || 'Nenhuma descrição disponível para este veículo.');
-      const status = getLocalizedText(v.production_status, fy?.productionStatusLabel || 'N/A');
-      const size = getLocalizedText(v.size, fy?.sizeLabel || 'N/A');
-      const type = getLocalizedText(v.type, fy?.classificationLabel || 'N/A');
-      const focus = getLocalizedText(v.focus, fy?.focus || 'N/A');
-      const cargoVal = v.cargo_capacity ?? fy?.cargo;
-      const cargo = cargoVal != null ? `${cargoVal} SCU` : 'N/A';
+      const crewMin = v.crew?.min ?? v.min_crew ?? '?';
+      const crewMax = v.crew?.max ?? v.max_crew ?? '?';
 
-      const crewMin = v.crew?.min ?? v.min_crew ?? fy?.minCrew ?? '?';
-      const crewMax = v.crew?.max ?? v.max_crew ?? fy?.maxCrew ?? '?';
+      const length = v.sizes?.length ?? v.length ?? 'N/A';
+      const beam = v.sizes?.beam ?? v.beam ?? 'N/A';
+      const height = v.sizes?.height ?? v.height ?? 'N/A';
 
-      const length = v.sizes?.length ?? v.length ?? fy?.length ?? 'N/A';
-      const beam = v.sizes?.beam ?? v.beam ?? fy?.beam ?? 'N/A';
-      const height = v.sizes?.height ?? v.height ?? fy?.height ?? 'N/A';
-
-      const massVal = v.mass ?? fy?.mass;
-      const mass = massVal != null ? `${Number(massVal).toLocaleString('pt-BR')} kg` : 'N/A';
-
-      const scmVal = v.speed?.scm ?? fy?.scmSpeed;
-      const maxVal = v.speed?.max ?? fy?.afterburnerSpeed;
-      const scmSpeed = scmVal != null ? `${scmVal} m/s` : 'N/A';
-      const maxSpeed = maxVal != null ? `${maxVal} m/s` : 'N/A';
-
-      const msrpVal = v.msrp ?? fy?.lastPledgePrice ?? fy?.pledgePrice;
-      const msrp = msrpVal != null ? `$${Number(msrpVal).toLocaleString('en-US')} USD` : 'N/A';
+      const mass = v.mass != null ? `${Number(v.mass).toLocaleString('pt-BR')} kg` : 'N/A';
+      const scmSpeed = v.speed?.scm != null ? `${v.speed.scm} m/s` : 'N/A';
+      const maxSpeed = v.speed?.max != null ? `${v.speed.max} m/s` : 'N/A';
+      const msrp = v.msrp != null ? `$${Number(v.msrp).toLocaleString('en-US')} USD` : 'N/A';
 
       const wikiSlug = encodeURIComponent((v.name || '').replace(/\s+/g, '_'));
       const wikiUrl = v.web_url || `https://starcitizen.tools/${wikiSlug}`;
 
       document.getElementById('modal-body').innerHTML = `
         ${isLoadingDetails ? `<div style="color:var(--accent-cyan);font-size:0.85rem;margin-bottom:0.8rem;">⟳ Sincronizando ficha técnica completa...</div>` : ''}
-        ${imgUrl ? `<img class="modal-hero" src="${escapeHtml(imgUrl)}" alt="${escapeHtml(v.name)}" onerror="this.style.display='none'">` : ''}
+        <img id="modal-hero-img" data-ship-name="${escapeHtml(v.name || '')}" class="modal-hero" src="${escapeHtml(imgUrl)}" alt="${escapeHtml(v.name)}" style="${imgUrl ? '' : 'display:none;'}" onerror="this.style.display='none'">
         <p class="modal-desc">${escapeHtml(desc)}</p>
         <div class="modal-grid">
           <div class="modal-stat-box"><small>Status</small><div>${escapeHtml(status)}</div></div>
@@ -916,6 +861,10 @@
         </div>
         <a class="wiki-link" href="${escapeHtml(wikiUrl)}" target="_blank" rel="noopener noreferrer">Abrir Página Oficial na Wiki &rarr;</a>
       `;
+
+      if (!imgUrl && v.name) {
+        fetchWikiImagesBatch([v.name]);
+      }
     }
 
     async function openModal(basicVehicle) {
